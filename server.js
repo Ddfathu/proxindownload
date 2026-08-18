@@ -10,12 +10,10 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 8080;
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 
-// Buat direktori unduhan jika belum ada
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-// Baca konfigurasi TCP Proxy dari Railway
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 
@@ -44,7 +42,6 @@ function updateRailwayProxyIP() {
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
 
-// State Konfigurasi DNS Aktif
 let DNS_CONFIG = {
   mode: 'DOH',
   activeName: 'Cloudflare DoH (Official)',
@@ -74,12 +71,9 @@ const dnsCache = new Map();
 async function resolveDomain(hostname) {
   const now = Date.now();
   const cached = dnsCache.get(hostname);
-  if (cached && (now - cached.time < 1000 * 60 * 10)) {
-    return cached.ip;
-  }
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
-    return hostname;
-  }
+  if (cached && (now - cached.time < 1000 * 60 * 10)) return cached.ip;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return hostname;
+
   if (DNS_CONFIG.mode === 'DOH') {
     try {
       const url = new URL(DNS_CONFIG.dohUrl);
@@ -99,6 +93,7 @@ async function resolveDomain(hostname) {
       }
     } catch (_) {}
   }
+
   if (DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer) {
     try {
       const resolver = new dns.Resolver();
@@ -108,13 +103,12 @@ async function resolveDomain(hostname) {
           if (!err && addresses && addresses.length > 0) {
             dnsCache.set(hostname, { ip: addresses[0], time: now });
             resolve(addresses[0]);
-          } else {
-            reject(err);
-          }
+          } else reject(err);
         });
       });
     } catch (_) {}
   }
+
   return new Promise((resolve) => {
     dns.lookup(hostname, (err, address) => {
       const ip = (!err && address) ? address : '104.16.123.96';
@@ -124,7 +118,6 @@ async function resolveDomain(hostname) {
   });
 }
 
-// Pembersihan otomatis file lama (> 24 Jam)
 setInterval(() => {
   try {
     const files = fs.readdirSync(DOWNLOAD_DIR);
@@ -132,21 +125,41 @@ setInterval(() => {
     files.forEach(file => {
       const filePath = path.join(DOWNLOAD_DIR, file);
       const stat = fs.statSync(filePath);
-      if (now - stat.mtimeMs > 1000 * 60 * 60 * 24) {
-        fs.unlinkSync(filePath);
-      }
+      if (now - stat.mtimeMs > 1000 * 60 * 60 * 24) fs.unlinkSync(filePath);
     });
   } catch (_) {}
 }, 1000 * 60 * 60);
 
-// Multi-Thread Parallel Downloader (16 Parallel Threads)
+// Header PC Desktop Chrome Lengkap (Anti-Throttling)
+function getPcHeaders(targetUrl, extraHeaders = {}) {
+  let host = '';
+  try { host = new URL(targetUrl).hostname; } catch (_) {}
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+    'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': host ? `https://${host}/` : 'https://www.google.com/',
+    ...extraHeaders
+  };
+}
+
+// 32-Thread Parallel Downloader Engine
 async function startRemoteDownload(targetUrl, customName) {
   const taskId = ++taskIdCounter;
-  let filename = customName || path.basename(new URL(targetUrl).pathname) || `file_${Date.now()}`;
+  let filename = customName || path.basename(new URL(targetUrl).pathname) || `video_${Date.now()}`;
+  if (!filename.includes('.')) filename += '.mp4';
   filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
   const destPath = path.join(DOWNLOAD_DIR, filename);
 
-  const THREADS = 16;
+  const THREADS = 32;
 
   const task = {
     id: taskId,
@@ -155,41 +168,64 @@ async function startRemoteDownload(targetUrl, customName) {
     downloadedBytes: 0,
     totalBytes: 0,
     progress: 0,
-    status: 'DOWNLOADING (16 THREADS)',
+    speed: '0 KB/s',
+    status: 'DOWNLOADING (32 THREADS)',
     error: null
   };
   activeDownloadTasks.set(taskId, task);
 
+  let lastDownloaded = 0;
+  const speedInterval = setInterval(() => {
+    const diff = task.downloadedBytes - lastDownloaded;
+    task.speed = formatBytes(diff) + '/s';
+    lastDownloaded = task.downloadedBytes;
+  }, 1000);
+
   try {
     const headRes = await fetch(targetUrl, {
-      method: 'HEAD',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      method: 'GET',
+      headers: getPcHeaders(targetUrl, { 'Range': 'bytes=0-0' })
     });
 
+    let totalBytes = 0;
+    const contentRange = headRes.headers.get('content-range');
     const contentLength = headRes.headers.get('content-length');
-    const acceptRanges = headRes.headers.get('accept-ranges');
 
-    if (!contentLength || acceptRanges !== 'bytes') {
-      task.status = 'DOWNLOADING (SINGLE THREAD)';
-      const res = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-      });
-      if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+    if (contentRange) {
+      const match = contentRange.match(/\/(\d+)/);
+      if (match) totalBytes = parseInt(match[1], 10);
+    } else if (contentLength) {
+      totalBytes = parseInt(contentLength, 10);
+    }
+
+    // Jika server menolak multi-thread, pakai stream tunggal ber-header PC
+    if (!totalBytes || (headRes.status !== 206 && !contentRange)) {
+      task.status = 'DOWNLOADING (TURBO STREAM)';
+      const streamRes = await fetch(targetUrl, { headers: getPcHeaders(targetUrl) });
+      if (!streamRes.ok) throw new Error(`HTTP Error ${streamRes.status}`);
+
+      const len = streamRes.headers.get('content-length');
+      if (len) task.totalBytes = parseInt(len, 10);
+
       const fileStream = fs.createWriteStream(destPath);
-      const reader = res.body.getReader();
+      const reader = streamRes.body.getReader();
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         fileStream.write(Buffer.from(value));
         task.downloadedBytes += value.length;
+        if (task.totalBytes > 0) {
+          task.progress = Math.floor((task.downloadedBytes / task.totalBytes) * 100);
+        }
       }
       fileStream.end();
+      clearInterval(speedInterval);
       task.status = 'COMPLETED';
       task.progress = 100;
       return;
     }
 
-    const totalBytes = parseInt(contentLength, 10);
     task.totalBytes = totalBytes;
 
     const fileFd = fs.openSync(destPath, 'w');
@@ -204,46 +240,49 @@ async function startRemoteDownload(targetUrl, customName) {
       const start = i * chunkSize;
       const end = Math.min((i + 1) * chunkSize - 1, totalBytes - 1);
 
-      const downloadPart = async () => {
+      const downloadChunk = async () => {
         const res = await fetch(targetUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Range': `bytes=${start}-${end}`
-          }
+          headers: getPcHeaders(targetUrl, { 'Range': `bytes=${start}-${end}` })
         });
 
-        if (!res.ok && res.status !== 206) {
-          throw new Error(`Part ${i} failed: HTTP ${res.status}`);
+        if (!res.ok && res.status !== 206) throw new Error(`Part ${i} err: ${res.status}`);
+
+        const reader = res.body.getReader();
+        let currentOffset = start;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkBuf = Buffer.from(value);
+
+          const fd = fs.openSync(destPath, 'r+');
+          fs.writeSync(fd, chunkBuf, 0, chunkBuf.length, currentOffset);
+          fs.closeSync(fd);
+
+          currentOffset += chunkBuf.length;
+          threadProgress[i] += chunkBuf.length;
+
+          task.downloadedBytes = threadProgress.reduce((a, b) => a + b, 0);
+          task.progress = Math.floor((task.downloadedBytes / task.totalBytes) * 100);
         }
-
-        const arrayBuffer = await res.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-
-        const fd = fs.openSync(destPath, 'r+');
-        fs.writeSync(fd, buffer, 0, buffer.length, start);
-        fs.closeSync(fd);
-
-        threadProgress[i] = buffer.length;
-        task.downloadedBytes = threadProgress.reduce((a, b) => a + b, 0);
-        task.progress = Math.floor((task.downloadedBytes / task.totalBytes) * 100);
       };
-
-      chunkPromises.push(downloadPart());
+      chunkPromises.push(downloadChunk());
     }
 
     await Promise.all(chunkPromises);
+    clearInterval(speedInterval);
     task.status = 'COMPLETED';
     task.progress = 100;
-
   } catch (err) {
+    clearInterval(speedInterval);
     task.status = 'FAILED';
     task.error = err.message;
     if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
   }
 }
 
-// Server TCP Core
-const server = net.createServer({ 
+// Server Core TCP
+const server = net.createServer({
   noDelay: true,
   allowHalfOpen: false,
   pauseOnConnect: false
@@ -271,11 +310,11 @@ const server = net.createServer({
   let targetSocket = null;
 
   const bridgeSockets = (sockA, sockB) => {
-    sockA.on('data', (d) => { 
+    sockA.on('data', (d) => {
       connData.bytesIn += d.length;
       globalTotalBytesIn += d.length;
     });
-    sockB.on('data', (d) => { 
+    sockB.on('data', (d) => {
       connData.bytesOut += d.length;
       globalTotalBytesOut += d.length;
     });
@@ -300,7 +339,6 @@ const server = net.createServer({
       isFirstPacket = false;
       const dataStr = chunk.toString('utf-8');
 
-      // 1. API & Web UI Handler
       if (dataStr.startsWith('GET /') || dataStr.startsWith('POST /')) {
         const firstLine = dataStr.split('\r\n')[0];
         const [method, fullPath] = firstLine.split(' ');
@@ -388,7 +426,6 @@ const server = net.createServer({
           return;
         }
 
-        // Direct Download ke HP (Support Range Requests untuk 1DM+)
         if (pathname.startsWith('/files/')) {
           const rawFilename = decodeURIComponent(pathname.replace('/files/', ''));
           const safeFilePath = path.join(DOWNLOAD_DIR, path.basename(rawFilename));
@@ -459,7 +496,6 @@ const server = net.createServer({
           return;
         }
 
-        // Scanner HTTP
         const hostMatch = dataStr.match(/Host:\s*([^\r\n:]+)(?::(\d+))?/i);
         const targetHost = hostMatch ? hostMatch[1].trim() : 'speed.cloudflare.com';
         const targetPort = hostMatch && hostMatch[2] ? parseInt(hostMatch[2], 10) : 80;
@@ -482,7 +518,6 @@ const server = net.createServer({
         return;
       }
 
-      // 2. HTTPS CONNECT
       if (dataStr.startsWith('CONNECT ')) {
         const match = dataStr.match(/CONNECT\s+([^:\s]+):(\d+)/i);
         if (match) {
@@ -508,7 +543,6 @@ const server = net.createServer({
         }
       }
 
-      // 3. VLESS / Trojan Stream Forwarding
       const sni = parseTlsSni(chunk);
       const destinationHost = sni || 'speed.cloudflare.com';
 
@@ -580,7 +614,7 @@ function renderDashboardHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Proxy & 16-Thread Downloader</title>
+  <title>Proxy & 32-Thread Downloader</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #06090e; color: #00ffcc; padding: 14px; margin: 0; display: flex; justify-content: center; }
@@ -627,7 +661,7 @@ function renderDashboardHTML() {
 </head>
 <body>
   <div class="card">
-    <h2>⚡ PROXY & 16-THREAD LEECH</h2>
+    <h2>⚡ PROXY & 32-THREAD LEECH</h2>
     
     <div class="proxy-box">
       <div>
@@ -658,11 +692,11 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <div class="section-title">📥 16-THREAD REMOTE DOWNLOADER</div>
+    <div class="section-title">📥 32-THREAD REMOTE DOWNLOADER</div>
     <div class="download-box">
       <input type="text" id="dl_url" placeholder="Tempel Link Terabox / Direct URL Video">
       <input type="text" id="dl_custom_name" placeholder="Nama File (Opsional, contoh: video.mp4)">
-      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ START 16-THREAD DOWNLOAD</button>
+      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ START 32-THREAD DOWNLOAD</button>
 
       <div id="task_container" style="margin-top:10px;"></div>
 
@@ -750,7 +784,7 @@ function renderDashboardHTML() {
           taskBox.innerHTML = data.downloadTasks.map(t => \`
             <div style="background:#090e17; padding:6px 8px; border-radius:6px; font-size:0.7rem; margin-top:4px; font-family:monospace;">
               <div>⚡ \${t.filename} (\${t.status})</div>
-              <div>Progress: \${t.progress}% (\${t.downloaded} / \${t.total})</div>
+              <div>Speed: \${t.speed || 'Calculating...'} | Progress: \${t.progress}% (\${t.downloaded} / \${t.total})</div>
             </div>
           \`).join('');
         } else {
@@ -857,5 +891,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Universal Proxy + 16-Thread Downloader running on port ${PORT}`);
+  console.log(`32-Thread Leech Downloader running on port ${PORT}`);
 });
