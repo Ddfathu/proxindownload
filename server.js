@@ -130,7 +130,6 @@ setInterval(() => {
   } catch (_) {}
 }, 1000 * 60 * 60);
 
-// Header PC Desktop Chrome Lengkap (Anti-Throttling)
 function getPcHeaders(targetUrl, extraHeaders = {}) {
   let host = '';
   try { host = new URL(targetUrl).hostname; } catch (_) {}
@@ -151,7 +150,7 @@ function getPcHeaders(targetUrl, extraHeaders = {}) {
   };
 }
 
-// 32-Thread Parallel Downloader Engine
+// 64-Thread Parallel Downloader Engine
 async function startRemoteDownload(targetUrl, customName) {
   const taskId = ++taskIdCounter;
   let filename = customName || path.basename(new URL(targetUrl).pathname) || `video_${Date.now()}`;
@@ -159,7 +158,7 @@ async function startRemoteDownload(targetUrl, customName) {
   filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
   const destPath = path.join(DOWNLOAD_DIR, filename);
 
-  const THREADS = 32;
+  const THREADS = 64; // Set langsung ke 64 Thread paralel
 
   const task = {
     id: taskId,
@@ -169,7 +168,7 @@ async function startRemoteDownload(targetUrl, customName) {
     totalBytes: 0,
     progress: 0,
     speed: '0 KB/s',
-    status: 'DOWNLOADING (32 THREADS)',
+    status: 'DOWNLOADING (64 THREADS)',
     error: null
   };
   activeDownloadTasks.set(taskId, task);
@@ -198,7 +197,6 @@ async function startRemoteDownload(targetUrl, customName) {
       totalBytes = parseInt(contentLength, 10);
     }
 
-    // Jika server menolak multi-thread, pakai stream tunggal ber-header PC
     if (!totalBytes || (headRes.status !== 206 && !contentRange)) {
       task.status = 'DOWNLOADING (TURBO STREAM)';
       const streamRes = await fetch(targetUrl, { headers: getPcHeaders(targetUrl) });
@@ -281,7 +279,7 @@ async function startRemoteDownload(targetUrl, customName) {
   }
 }
 
-// Server Core TCP
+// Server TCP Core
 const server = net.createServer({
   noDelay: true,
   allowHalfOpen: false,
@@ -614,7 +612,7 @@ function renderDashboardHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Proxy & 32-Thread Downloader</title>
+  <title>Proxy & 64-Thread Downloader</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #06090e; color: #00ffcc; padding: 14px; margin: 0; display: flex; justify-content: center; }
@@ -661,7 +659,7 @@ function renderDashboardHTML() {
 </head>
 <body>
   <div class="card">
-    <h2>⚡ PROXY & 32-THREAD LEECH</h2>
+    <h2>⚡ PROXY & 64-THREAD LEECH</h2>
     
     <div class="proxy-box">
       <div>
@@ -692,11 +690,11 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <div class="section-title">📥 32-THREAD REMOTE DOWNLOADER</div>
+    <div class="section-title">📥 64-THREAD REMOTE DOWNLOADER</div>
     <div class="download-box">
       <input type="text" id="dl_url" placeholder="Tempel Link Terabox / Direct URL Video">
       <input type="text" id="dl_custom_name" placeholder="Nama File (Opsional, contoh: video.mp4)">
-      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ START 32-THREAD DOWNLOAD</button>
+      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ START 64-THREAD DOWNLOAD</button>
 
       <div id="task_container" style="margin-top:10px;"></div>
 
@@ -891,5 +889,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`32-Thread Leech Downloader running on port ${PORT}`);
+  console.log(`64-Thread Leech Downloader running on port ${PORT}`);
 });
