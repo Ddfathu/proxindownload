@@ -10,12 +10,12 @@ const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT || 8080;
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 
-// Buat folder download jika belum ada
+// Buat direktori unduhan jika belum ada
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-// Baca Environment Variables Railway
+// Baca konfigurasi TCP Proxy dari Railway
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
 const TCP_PORT = process.env.RAILWAY_TCP_PROXY_PORT || '';
 
@@ -44,7 +44,7 @@ function updateRailwayProxyIP() {
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
 
-// State DNS
+// State Konfigurasi DNS Aktif
 let DNS_CONFIG = {
   mode: 'DOH',
   activeName: 'Cloudflare DoH (Official)',
@@ -62,9 +62,8 @@ const PRESETS = {
   'google-udp': { name: 'Google UDP (8.8.8.8)', type: 'UDP', host: '8.8.8.8', port: 53 }
 };
 
-// Monitor Koneksi & Cloud Tasks
 const activeConnections = new Map();
-const activeDownloadTasks = new Map(); // Task download dari URL ke Railway
+const activeDownloadTasks = new Map();
 let connectionIdCounter = 0;
 let taskIdCounter = 0;
 let globalTotalBytesIn = 0;
@@ -125,7 +124,7 @@ async function resolveDomain(hostname) {
   });
 }
 
-// Routine Pembersihan File Lama (> 24 Jam)
+// Pembersihan otomatis file lama (> 24 Jam)
 setInterval(() => {
   try {
     const files = fs.readdirSync(DOWNLOAD_DIR);
@@ -140,12 +139,14 @@ setInterval(() => {
   } catch (_) {}
 }, 1000 * 60 * 60);
 
-// Helper Background Downloader (Internet -> Railway)
+// Multi-Thread Parallel Downloader (16 Parallel Threads)
 async function startRemoteDownload(targetUrl, customName) {
   const taskId = ++taskIdCounter;
   let filename = customName || path.basename(new URL(targetUrl).pathname) || `file_${Date.now()}`;
   filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
   const destPath = path.join(DOWNLOAD_DIR, filename);
+
+  const THREADS = 16;
 
   const task = {
     id: taskId,
@@ -154,35 +155,86 @@ async function startRemoteDownload(targetUrl, customName) {
     downloadedBytes: 0,
     totalBytes: 0,
     progress: 0,
-    status: 'DOWNLOADING',
+    status: 'DOWNLOADING (16 THREADS)',
     error: null
   };
   activeDownloadTasks.set(taskId, task);
 
   try {
-    const res = await fetch(targetUrl, {
+    const headRes = await fetch(targetUrl, {
+      method: 'HEAD',
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
     });
 
-    if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
-    const contentLength = res.headers.get('content-length');
-    if (contentLength) task.totalBytes = parseInt(contentLength, 10);
+    const contentLength = headRes.headers.get('content-length');
+    const acceptRanges = headRes.headers.get('accept-ranges');
 
-    const fileStream = fs.createWriteStream(destPath);
-    const reader = res.body.getReader();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      fileStream.write(Buffer.from(value));
-      task.downloadedBytes += value.length;
-      if (task.totalBytes > 0) {
-        task.progress = Math.floor((task.downloadedBytes / task.totalBytes) * 100);
+    if (!contentLength || acceptRanges !== 'bytes') {
+      task.status = 'DOWNLOADING (SINGLE THREAD)';
+      const res = await fetch(targetUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      });
+      if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+      const fileStream = fs.createWriteStream(destPath);
+      const reader = res.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fileStream.write(Buffer.from(value));
+        task.downloadedBytes += value.length;
       }
+      fileStream.end();
+      task.status = 'COMPLETED';
+      task.progress = 100;
+      return;
     }
-    fileStream.end();
+
+    const totalBytes = parseInt(contentLength, 10);
+    task.totalBytes = totalBytes;
+
+    const fileFd = fs.openSync(destPath, 'w');
+    fs.ftruncateSync(fileFd, totalBytes);
+    fs.closeSync(fileFd);
+
+    const chunkSize = Math.ceil(totalBytes / THREADS);
+    const chunkPromises = [];
+    const threadProgress = new Array(THREADS).fill(0);
+
+    for (let i = 0; i < THREADS; i++) {
+      const start = i * chunkSize;
+      const end = Math.min((i + 1) * chunkSize - 1, totalBytes - 1);
+
+      const downloadPart = async () => {
+        const res = await fetch(targetUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Range': `bytes=${start}-${end}`
+          }
+        });
+
+        if (!res.ok && res.status !== 206) {
+          throw new Error(`Part ${i} failed: HTTP ${res.status}`);
+        }
+
+        const arrayBuffer = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        const fd = fs.openSync(destPath, 'r+');
+        fs.writeSync(fd, buffer, 0, buffer.length, start);
+        fs.closeSync(fd);
+
+        threadProgress[i] = buffer.length;
+        task.downloadedBytes = threadProgress.reduce((a, b) => a + b, 0);
+        task.progress = Math.floor((task.downloadedBytes / task.totalBytes) * 100);
+      };
+
+      chunkPromises.push(downloadPart());
+    }
+
+    await Promise.all(chunkPromises);
     task.status = 'COMPLETED';
     task.progress = 100;
+
   } catch (err) {
     task.status = 'FAILED';
     task.error = err.message;
@@ -190,7 +242,7 @@ async function startRemoteDownload(targetUrl, customName) {
   }
 }
 
-// Server TCP Hybrid
+// Server TCP Core
 const server = net.createServer({ 
   noDelay: true,
   allowHalfOpen: false,
@@ -248,14 +300,13 @@ const server = net.createServer({
       isFirstPacket = false;
       const dataStr = chunk.toString('utf-8');
 
-      // 1. CEK API, DASHBOARD & DIRECT DOWNLOAD KE HP
+      // 1. API & Web UI Handler
       if (dataStr.startsWith('GET /') || dataStr.startsWith('POST /')) {
         const firstLine = dataStr.split('\r\n')[0];
         const [method, fullPath] = firstLine.split(' ');
         const urlObj = new URL(fullPath, 'http://localhost');
         const pathname = urlObj.pathname;
 
-        // API Status Monitor & Task List
         if (pathname === '/api/stats') {
           const activeList = Array.from(activeConnections.values())
             .filter(c => !c.target.includes('railway.com') && !c.target.includes('up.railway.app'))
@@ -269,7 +320,6 @@ const server = net.createServer({
               bytesOut: formatBytes(c.bytesOut)
             }));
 
-          // Ambil daftar file yang tersimpan di Railway
           let storageFiles = [];
           try {
             const files = fs.readdirSync(DOWNLOAD_DIR);
@@ -303,7 +353,6 @@ const server = net.createServer({
           return;
         }
 
-        // API Tambah Unduhan Cloud (URL -> Railway)
         if (pathname === '/api/start-download' && method === 'POST') {
           try {
             const bodyStr = dataStr.split('\r\n\r\n')[1] || '{}';
@@ -323,7 +372,6 @@ const server = net.createServer({
           return;
         }
 
-        // API Hapus File dari Railway
         if (pathname === '/api/delete-file' && method === 'POST') {
           try {
             const bodyStr = dataStr.split('\r\n\r\n')[1] || '{}';
@@ -340,7 +388,7 @@ const server = net.createServer({
           return;
         }
 
-        // DIRECT DOWNLOAD KE HP (Railway -> HP)
+        // Direct Download ke HP (Support Range Requests untuk 1DM+)
         if (pathname.startsWith('/files/')) {
           const rawFilename = decodeURIComponent(pathname.replace('/files/', ''));
           const safeFilePath = path.join(DOWNLOAD_DIR, path.basename(rawFilename));
@@ -371,7 +419,6 @@ const server = net.createServer({
           return;
         }
 
-        // Endpoint Set DNS
         if (pathname.startsWith('/api/set-dns') && method === 'POST') {
           try {
             const bodyStr = dataStr.split('\r\n\r\n')[1] || '{}';
@@ -405,7 +452,6 @@ const server = net.createServer({
           return;
         }
 
-        // Web Dashboard HTML
         if (pathname === '/' || pathname === '/index.html') {
           const html = renderDashboardHTML();
           clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
@@ -413,7 +459,7 @@ const server = net.createServer({
           return;
         }
 
-        // 2. SCANNER HTTP
+        // Scanner HTTP
         const hostMatch = dataStr.match(/Host:\s*([^\r\n:]+)(?::(\d+))?/i);
         const targetHost = hostMatch ? hostMatch[1].trim() : 'speed.cloudflare.com';
         const targetPort = hostMatch && hostMatch[2] ? parseInt(hostMatch[2], 10) : 80;
@@ -436,7 +482,7 @@ const server = net.createServer({
         return;
       }
 
-      // 3. HTTPS CONNECT PROXY
+      // 2. HTTPS CONNECT
       if (dataStr.startsWith('CONNECT ')) {
         const match = dataStr.match(/CONNECT\s+([^:\s]+):(\d+)/i);
         if (match) {
@@ -462,7 +508,7 @@ const server = net.createServer({
         }
       }
 
-      // 4. STREAM VLESS / TROJAN (DARKTUNNEL)
+      // 3. VLESS / Trojan Stream Forwarding
       const sni = parseTlsSni(chunk);
       const destinationHost = sni || 'speed.cloudflare.com';
 
@@ -534,7 +580,7 @@ function renderDashboardHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Proxy & Cloud Leech Dashboard</title>
+  <title>Proxy & 16-Thread Downloader</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #06090e; color: #00ffcc; padding: 14px; margin: 0; display: flex; justify-content: center; }
@@ -563,7 +609,6 @@ function renderDashboardHTML() {
     .tag { background: #032b17; color: #39ff14; padding: 2px 6px; border-radius: 4px; border: 1px solid #39ff14; font-size: 0.65rem; font-weight: bold; }
     .conn-target { font-family: monospace; font-size: 0.75rem; color: #38bdf8; word-break: break-all; }
     
-    /* Box Downloader UI */
     .download-box { background: #030712; border: 1px solid #38bdf8; border-radius: 10px; padding: 12px; margin-top: 8px; }
     .file-item { background: #090e17; border: 1px solid #1e293b; border-radius: 6px; padding: 8px 10px; margin-top: 6px; display: flex; justify-content: space-between; align-items: center; }
     .file-info { font-family: monospace; font-size: 0.75rem; color: #fff; max-width: 60%; word-break: break-all; }
@@ -582,7 +627,7 @@ function renderDashboardHTML() {
 </head>
 <body>
   <div class="card">
-    <h2>⚡ PROXY & CLOUD LEECH</h2>
+    <h2>⚡ PROXY & 16-THREAD LEECH</h2>
     
     <div class="proxy-box">
       <div>
@@ -613,17 +658,14 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <!-- FITUR CLOUD LEECH & REMOTE DOWNLOAD -->
-    <div class="section-title">📥 CLOUD REMOTE DOWNLOADER (STAGING)</div>
+    <div class="section-title">📥 16-THREAD REMOTE DOWNLOADER</div>
     <div class="download-box">
-      <input type="text" id="dl_url" placeholder="Tempel Link File / Video Direct URL">
+      <input type="text" id="dl_url" placeholder="Tempel Link Terabox / Direct URL Video">
       <input type="text" id="dl_custom_name" placeholder="Nama File (Opsional, contoh: video.mp4)">
-      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ DOWNLOAD KE RAILWAY</button>
+      <button class="btn-main" style="background:#38bdf8;" onclick="submitRemoteDownload()">⚡ START 16-THREAD DOWNLOAD</button>
 
-      <!-- Task Progress -->
       <div id="task_container" style="margin-top:10px;"></div>
 
-      <!-- File Tersimpan di Railway -->
       <div style="font-size:0.75rem; color:#94a3b8; margin-top:12px; font-weight:bold;">📁 File Tersimpan di Server:</div>
       <div id="file_list_container"></div>
     </div>
@@ -685,7 +727,6 @@ function renderDashboardHTML() {
         document.getElementById('total_rx').innerText = data.globalTotalIn;
         document.getElementById('total_tx').innerText = data.globalTotalOut;
 
-        // Render File List di Railway
         const fileBox = document.getElementById('file_list_container');
         if (!data.storageFiles || data.storageFiles.length === 0) {
           fileBox.innerHTML = '<div style="font-size:0.7rem; color:#64748b; padding:4px 0;">Belum ada file di server.</div>';
@@ -704,7 +745,6 @@ function renderDashboardHTML() {
           \`).join('');
         }
 
-        // Render Task Unduhan
         const taskBox = document.getElementById('task_container');
         if (data.downloadTasks && data.downloadTasks.length > 0) {
           taskBox.innerHTML = data.downloadTasks.map(t => \`
@@ -717,7 +757,6 @@ function renderDashboardHTML() {
           taskBox.innerHTML = '';
         }
 
-        // Render Koneksi VLESS
         const container = document.getElementById('conn_container');
         if (!data.connections || data.connections.length === 0) {
           container.innerHTML = '<div style="text-align:center; color:#64748b; font-size:0.75rem; padding:10px;">Belum ada perangkat terhubung...</div>';
@@ -818,5 +857,5 @@ function renderDashboardHTML() {
 }
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Universal Proxy + Cloud Leech Downloader running on port ${PORT}`);
+  console.log(`Universal Proxy + 16-Thread Downloader running on port ${PORT}`);
 });
